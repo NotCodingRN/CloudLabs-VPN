@@ -6,6 +6,16 @@ Made by Alaa Aladdin.
 
 It comes as **CloudLabs-VPN Admin** (setup wizard and dashboard), a **web admin panel** (students, limits, start and pause), and the **CloudLabs-VPN** Windows app students sign in to. It installs separately from DormVPN and can sit next to it on one PC, but only one can be connected at a time.
 
+## Download
+
+1. Open [Releases](https://github.com/NotCodingRN/CloudLabs-VPN/releases/latest) and download `cloudlabs-vpn-admin-vX.Y.Z.zip`.
+2. Unzip it somewhere permanent, like Documents. Your keys and settings are saved in its `data` folder, so don't delete it while your VPN is running.
+3. Run **CloudLabs-VPN Admin.exe**. If Windows SmartScreen warns you, click **More info**, then **Run anyway** (the app isn't code-signed).
+4. Follow the setup: it walks you through the AWS CLI and your AWS keys, then creates your VPN. The VPN engine is already included.
+5. Open the admin panel it gives you to add users, then use **Build installer…** to make the app your users install.
+
+You need Windows 10 or 11 and an AWS account. Want to change the code instead? See *Getting started* below.
+
 ## Getting started
 
 You need Windows 10 or 11, [Git](https://git-scm.com/download/win), and an [AWS account](https://aws.amazon.com/). Nothing else: the apps build with the compiler that comes with Windows.
