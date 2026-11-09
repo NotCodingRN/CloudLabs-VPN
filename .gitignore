@@ -1,0 +1,11 @@
+# Created when you build and use CloudLabs-VPN. data\ holds your keys: never commit it.
+app/
+data/
+installers/
+
+# Build leftovers
+obj/
+dist/
+bin/
+*.log
+__pycache__/
