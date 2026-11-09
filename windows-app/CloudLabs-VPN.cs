@@ -22,7 +22,7 @@ namespace CloudLabsVPN
     static class Program
     {
         [STAThread]
-        static void Main(string[] args)
+        static void Main()
         {
             bool created;
             using (var m = new Mutex(true, "Global\\CloudLabs-VPN-single-instance", out created))
@@ -36,8 +36,7 @@ namespace CloudLabsVPN
                 ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072; // TLS 1.2
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
-                bool background = Array.Exists(args, a => a.Equals("/background", StringComparison.OrdinalIgnoreCase));
-                Application.Run(new ClientApp(background));
+                Application.Run(new ClientApp());
             }
         }
     }
@@ -63,7 +62,7 @@ namespace CloudLabsVPN
 
         MainForm form;
         NotifyIcon tray;
-        ToolStripMenuItem miOpen, miToggle, miAutoConnect, miStartup;
+        ToolStripMenuItem miOpen, miToggle, miAutoConnect;
         System.Windows.Forms.Timer timer;
         Icon icoOff, icoWait, icoOn;
         bool hintedTray;
@@ -83,7 +82,7 @@ namespace CloudLabsVPN
         readonly object logLock = new object();
         static readonly Regex Ansi = new Regex("\x1B\\[[0-9;]*m", RegexOptions.Compiled);
 
-        public ClientApp(bool background)
+        public ClientApp()
         {
             icoOff = Theme.MakeIcon(Theme.Grey);
             icoWait = Theme.MakeIcon(Color.FromArgb(240, 160, 32));
@@ -97,11 +96,10 @@ namespace CloudLabsVPN
             miOpen = new ToolStripMenuItem("Open CloudLabs-VPN", null, delegate { ShowWindow(); }) { Font = Theme.B(9) };
             miToggle = new ToolStripMenuItem("Connect", null, delegate { Toggle(); });
             miAutoConnect = new ToolStripMenuItem("Connect when CloudLabs-VPN opens", null, delegate { miAutoConnect.Checked = !miAutoConnect.Checked; WriteSetting("autoconnect", miAutoConnect.Checked ? "1" : "0"); });
-            miStartup = new ToolStripMenuItem("Start CloudLabs-VPN when I sign in", null, delegate { ToggleStartup(); });
-            menu.Items.AddRange(new ToolStripItem[] { miOpen, miToggle, new ToolStripSeparator(), miAutoConnect, miStartup,
+            menu.Items.AddRange(new ToolStripItem[] { miOpen, miToggle, new ToolStripSeparator(), miAutoConnect,
                 new ToolStripMenuItem("Open log", null, delegate { Ui.Open(LogPath); }), new ToolStripSeparator(),
                 new ToolStripMenuItem("Quit CloudLabs-VPN", null, delegate { Quit(); }) });
-            menu.Opening += delegate { miStartup.Checked = StartupTaskExists(); miToggle.Enabled = Token != ""; };
+            menu.Opening += delegate { miToggle.Enabled = Token != ""; };
             miAutoConnect.Checked = ReadSetting("autoconnect", "1") == "1";
 
             tray = new NotifyIcon { Icon = icoOff, Text = "CloudLabs-VPN", ContextMenuStrip = menu, Visible = true };
@@ -128,7 +126,7 @@ namespace CloudLabsVPN
             Log("[app] CloudLabs-VPN started");
             if (Token != "") { RefreshMe(true); }
             Refresh();
-            if (!background || Token == "") ShowWindow();
+            ShowWindow();
         }
 
         public void ShowWindow()
@@ -452,26 +450,6 @@ namespace CloudLabsVPN
         }
 
         void WriteSetting(string key, string val) { try { File.WriteAllText(SettingsPath, key + "=" + val + Environment.NewLine); } catch { } }
-
-        bool StartupTaskExists() { return RunHidden("schtasks.exe", "/Query /TN CloudLabs-VPN") == 0; }
-
-        void ToggleStartup()
-        {
-            if (StartupTaskExists()) RunHidden("schtasks.exe", "/Delete /TN CloudLabs-VPN /F");
-            else RunHidden("schtasks.exe", "/Create /TN CloudLabs-VPN /TR \"\\\"" + Application.ExecutablePath + "\\\" /background\" /SC ONLOGON /RL HIGHEST /F");
-        }
-
-        static int RunHidden(string file, string args)
-        {
-            try
-            {
-                var p = Process.Start(new ProcessStartInfo(file, args) { CreateNoWindow = true, UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true });
-                p.StandardOutput.ReadToEnd(); p.StandardError.ReadToEnd();
-                p.WaitForExit(10000);
-                return p.ExitCode;
-            }
-            catch { return -1; }
-        }
 
         void RotateLog()
         {
