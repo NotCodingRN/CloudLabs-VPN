@@ -15,24 +15,51 @@ namespace CloudLabsVPN.Shared
 {
     static class Theme
     {
-        public static readonly Color Bg = Color.FromArgb(13, 17, 23);
-        public static readonly Color Card = Color.FromArgb(22, 27, 34);
-        public static readonly Color Field = Color.FromArgb(13, 17, 23);
-        public static readonly Color Ink = Color.FromArgb(230, 237, 243);
-        public static readonly Color Muted = Color.FromArgb(139, 148, 158);
-        public static readonly Color Line = Color.FromArgb(48, 54, 61);
-        public static readonly Color Soft = Color.FromArgb(33, 38, 45);
-        public static readonly Color Accent = Color.FromArgb(56, 189, 248);
-        public static readonly Color AccentHover = Color.FromArgb(125, 211, 252);
-        public static readonly Color AccentDark = Color.FromArgb(14, 165, 233);
-        public static readonly Color OnAccent = Color.FromArgb(4, 18, 28);
-        public static readonly Color Warn = Color.FromArgb(240, 180, 41);
-        public static readonly Color Bad = Color.FromArgb(248, 81, 73);
-        public static readonly Color Grey = Color.FromArgb(110, 118, 129);
+        public static readonly Color Bg = Color.FromArgb(15, 39, 64);
+        public static readonly Color Card = Color.FromArgb(21, 50, 79);
+        public static readonly Color Field = Color.FromArgb(12, 32, 53);
+        public static readonly Color Ink = Color.FromArgb(234, 244, 255);
+        public static readonly Color Muted = Color.FromArgb(143, 176, 207);
+        public static readonly Color Line = Color.FromArgb(36, 73, 111);
+        public static readonly Color Soft = Color.FromArgb(27, 59, 92);
+        public static readonly Color Accent = Color.FromArgb(255, 138, 76);
+        public static readonly Color AccentHover = Color.FromArgb(255, 166, 118);
+        public static readonly Color AccentDark = Color.FromArgb(232, 112, 50);
+        public static readonly Color OnAccent = Color.FromArgb(42, 18, 5);
+        public static readonly Color Warn = Color.FromArgb(255, 209, 102);
+        public static readonly Color Bad = Color.FromArgb(255, 107, 127);
+        public static readonly Color Grey = Color.FromArgb(104, 134, 166);
+        public static readonly Color Busy = Color.FromArgb(92, 200, 255);
+        public static readonly Color GridLine = Color.FromArgb(24, 54, 86);
+        public const bool Grid = true, Gauge = true;
+        const string DisplayFamily = "Bahnschrift SemiBold Condensed";
 
         public static Font F(float size) { return new Font("Segoe UI", size, FontStyle.Regular, GraphicsUnit.Point); }
         public static Font B(float size) { return new Font("Segoe UI Semibold", size, FontStyle.Regular, GraphicsUnit.Point); }
         public static Font Mono(float size) { return new Font("Consolas", size, FontStyle.Regular, GraphicsUnit.Point); }
+        public static Font D(float size) { return new Font(DisplayFamily, size, FontStyle.Regular, GraphicsUnit.Point); }
+
+        /// The window background (and the blueprint grid in CloudLabs), lined up across controls.
+        public static void PaintBackdrop(Graphics g, Control c)
+        {
+            g.Clear(Bg);
+            if (!Grid) return;
+            var f = c.FindForm();
+            var o = f != null && c.IsHandleCreated ? f.PointToClient(c.PointToScreen(Point.Empty)) : Point.Empty;
+            const int step = 24;
+            using (var pen = new Pen(GridLine))
+            {
+                for (int x = -(((o.X % step) + step) % step); x < c.Width; x += step) g.DrawLine(pen, x, 0, x, c.Height);
+                for (int y = -(((o.Y % step) + step) % step); y < c.Height; y += step) g.DrawLine(pen, 0, y, c.Width, y);
+            }
+        }
+
+        /// What shows around a rounded control: the backdrop if its parent draws one, else the parent's colour.
+        public static void PaintUnder(Graphics g, Control c)
+        {
+            var p = c.Parent;
+            if (p != null && "grid".Equals(p.Tag)) PaintBackdrop(g, c); else g.Clear(p != null ? p.BackColor : Bg);
+        }
 
         public static GraphicsPath Round(RectangleF r, float radius)
         {
@@ -172,7 +199,7 @@ namespace CloudLabsVPN.Shared
         {
             var g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.Clear(Parent != null ? Parent.BackColor : Theme.Bg);
+            Theme.PaintUnder(g, this);
             using (var path = Theme.Round(new RectangleF(0.5f, 0.5f, Width - 1.5f, Height - 1.5f), 12))
             {
                 using (var b = new SolidBrush(fill)) g.FillPath(b, path);
@@ -195,7 +222,7 @@ namespace CloudLabsVPN.Shared
         {
             var g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.Clear(Parent != null ? Parent.BackColor : Theme.Card);
+            Theme.PaintUnder(g, this);
             var r = new RectangleF(0, 0, Width - 1, Height - 1);
             using (var path = Theme.Round(r, Height / 2f)) using (var b = new SolidBrush(Theme.Line)) g.FillPath(b, path);
             if (value > 0)
@@ -227,7 +254,7 @@ namespace CloudLabsVPN.Shared
         {
             var g = e.Graphics;
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.Clear(Parent != null ? Parent.BackColor : Theme.Card);
+            Theme.PaintUnder(g, this);
             using (var path = Theme.Round(new RectangleF(0.5f, 0.5f, Width - 1.5f, Height - 1.5f), 8))
             {
                 using (var b = new SolidBrush(Theme.Field)) g.FillPath(b, path);

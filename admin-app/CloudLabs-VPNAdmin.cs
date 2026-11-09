@@ -208,7 +208,7 @@ namespace CloudLabsVPN.Admin
             page = new Panel { Bounds = new Rectangle(0, 0, W - Side, H), BackColor = Theme.Bg, AutoScroll = true };
             content.Controls.Add(page);
             y = 34;
-            Add(Ui.Text(title, Theme.B(17), Theme.Ink), 36);
+            Add(Ui.Text(title, Theme.D(21), Theme.Ink), 36);
             y += 6;
             if (subtitle != null) Para(subtitle, Theme.Muted);
             y += 8;
@@ -290,7 +290,7 @@ namespace CloudLabsVPN.Admin
             var logo = new Panel { Bounds = new Rectangle(24, 28, 30, 30), BackColor = Theme.Card };
             logo.Paint += (s, e) => Theme.DrawShield(e.Graphics, new RectangleF(0, 0, 30, 30), Theme.Accent);
             sidebar.Controls.Add(logo);
-            var t = Ui.Text("CloudLabs-VPN Admin", Theme.B(11), Theme.Ink); t.Location = new Point(58, 32); sidebar.Controls.Add(t);
+            var t = Ui.Text("CloudLabs-VPN Admin", Theme.D(13), Theme.Ink); t.Location = new Point(58, 32); sidebar.Controls.Add(t);
             var foot = Ui.Text("Made by Alaa Aladdin", Theme.F(8), Theme.Grey); foot.Location = new Point(24, H - 26); sidebar.Controls.Add(foot);
             if (!wizard) return;
             var sub = Ui.Text("Setup", Theme.F(9), Theme.Muted); sub.Location = new Point(26, 84); sidebar.Controls.Add(sub);

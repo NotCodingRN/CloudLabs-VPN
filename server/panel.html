@@ -3,15 +3,18 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600&display=swap" rel="stylesheet">
 <title>CloudLabs-VPN Admin</title>
 <style>
 :root {
   color-scheme: dark;
-  --bg: #0d1117; --card: #161b22; --ink: #e6edf3; --muted: #8b949e; --line: #30363d; --soft: #21262d;
-  --accent: #38bdf8; --accent-ink: #04121c; --warn: #f0b429; --bad: #f85149; --bar: #38bdf8; --shadow: 0 8px 24px rgba(0,0,0,.35);
+  --bg: #0f2740; --card: #15324f; --ink: #eaf4ff; --muted: #8fb0cf; --line: #24496f; --soft: #1b3b5c;
+  --accent: #ff8a4c; --accent-ink: #2a1205; --warn: #ffd166; --bad: #ff6b7f; --busy: #5cc8ff; --bar: #ff8a4c;
+  --shadow: 0 10px 30px rgba(0,0,0,.28);
+  --display: "Bahnschrift", "Barlow Condensed", "Segoe UI", sans-serif;
 }
 * { box-sizing: border-box; }
-body { margin: 0; background: radial-gradient(1000px 420px at 50% -120px, color-mix(in srgb, var(--accent) 14%, transparent), transparent), var(--bg); background-attachment: fixed; min-height: 100vh; color: var(--ink); font: 15px/1.5 "Segoe UI", system-ui, -apple-system, Roboto, sans-serif; }
+body { margin: 0; background: var(--bg); background-image: linear-gradient(#183656 1px, transparent 1px), linear-gradient(90deg, #183656 1px, transparent 1px); background-size: 24px 24px; min-height: 100vh; color: var(--ink); font: 15px/1.5 "Segoe UI", system-ui, -apple-system, Roboto, sans-serif; }
 main { max-width: 980px; margin: 0 auto; padding: 24px 16px 64px; }
 header { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; }
 header h1 { font-size: 20px; margin: 0; flex: 1; display: flex; align-items: center; gap: 10px; }
@@ -29,8 +32,14 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 button.primary:hover { filter: brightness(1.06); }
 button.danger { color: var(--bad); }
 button:disabled { opacity: .55; cursor: default; }
-input, select { font: inherit; font-size: 14px; padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px;
+input, select, textarea { font: inherit; font-size: 14px; padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px;
   background: var(--bg); color: var(--ink); width: 100%; }
+h1, h2, h3, .stat .v { font-family: var(--display); font-weight: 600; font-stretch: condensed; letter-spacing: .005em; }
+textarea { resize: vertical; width: 100%; }
+.mono { font-family: Consolas, "Cascadia Mono", ui-monospace, monospace; }
+.pill.wait { color: var(--busy); }
+.bulk { max-height: 320px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
+.bulk td, .bulk th { padding: 7px 10px; }
 label { display: block; font-size: 13px; color: var(--muted); margin: 0 0 4px; }
 .row { display: flex; gap: 10px; align-items: end; flex-wrap: wrap; }
 .row > div { flex: 1; min-width: 140px; }
@@ -103,7 +112,7 @@ dialog h3 { margin: 0 0 12px; font-size: 17px; }
     </div>
 
     <div class="card">
-      <h2>Users <button class="primary" id="addBtn">Add user</button></h2>
+      <h2 style="justify-content:flex-start">Users <span id="uCount" class="muted small"></span><span class="actions" style="margin-left:auto"><input id="q" type="search" placeholder="Search users" aria-label="Search users" style="width:170px"><button class="primary" id="addBtn">Add users</button></span></h2>
       <table>
         <thead><tr><th>User</th><th>This month</th><th>Status</th><th></th></tr></thead>
         <tbody id="users"></tbody>
@@ -128,15 +137,22 @@ dialog h3 { margin: 0 0 12px; font-size: 17px; }
 </main>
 
 <dialog id="addDlg">
-  <h3>Add user</h3>
+  <h3>Add users</h3>
   <form id="addForm">
-    <label for="aName">Student ID or name</label><input id="aName" required maxlength="32" placeholder="e.g. 202100123 or Ahmed Ali" autocomplete="off">
+    <label for="aName">Student IDs or names, one per line</label><textarea id="aName" rows="6" required placeholder="202100123&#10;202100124&#10;Ahmed Ali" autocomplete="off"></textarea>
     <div style="height:10px"></div>
-    <label for="aLimit">Monthly limit (GB, 0 = unlimited)</label><input id="aLimit" type="number" min="0" step="1" value="10">
-    <p class="muted small">A password is generated for them.</p>
-    <p class="err" id="addErr"></p>
-    <div class="dlg-actions"><button type="button" data-close>Cancel</button><button class="primary" type="submit">Add user</button></div>
+    <label for="aLimit">Monthly limit for each (GB, 0 = unlimited)</label><input id="aLimit" type="number" min="0" step="1" value="10">
+    <p class="muted small">Each user gets a generated password. You see them once, so download the list.</p>
+    <p class="err" id="addErr" style="white-space:pre-line"></p>
+    <div class="dlg-actions"><button type="button" data-close>Cancel</button><button class="primary" type="submit" id="addGo">Add</button></div>
   </form>
+</dialog>
+
+<dialog id="bulkDlg">
+  <h3 id="bulkTitle"></h3>
+  <div class="bulk"><table><thead><tr><th>User</th><th>Password</th></tr></thead><tbody id="bulkRows"></tbody></table></div>
+  <p class="muted small">These passwords aren't shown again. You can always make a new one.</p>
+  <div class="dlg-actions"><button id="bulkCopy">Copy all</button><button id="bulkCsv">Download list</button><button class="primary" data-close>Done</button></div>
 </dialog>
 
 <dialog id="pwDlg">
@@ -176,7 +192,7 @@ dialog h3 { margin: 0 0 12px; font-size: 17px; }
 <script>
 const $ = id => document.getElementById(id);
 let token = sessionStorage.getItem("dvpn_admin") || "";
-let state = null, qrLink = "";
+let state = null, qrLink = "", q = "";
 
 const gb = b => (b / 1e9).toFixed(b < 1e10 ? 2 : 1);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -201,6 +217,7 @@ $("loginForm").onsubmit = async e => {
   } catch (err) { $("loginErr").textContent = err.message; }
 };
 $("logoutBtn").onclick = signOut;
+$("q").oninput = () => { q = $("q").value.trim().toLowerCase(); if (state) render(); };
 $("refreshBtn").onclick = () => load().then(() => toast("Up to date"));
 
 const STATES = { running: ["Running", "on"], pending: ["Starting", "wait"], stopping: ["Pausing", "wait"], stopped: ["Paused", "off"], "shutting-down": ["Shutting down", "bad"], terminated: ["Deleted", "bad"] };
@@ -218,14 +235,17 @@ function render() {
   $("totCost").textContent = "$" + (Math.max(0, total / 1e9 - 100) * 0.09).toFixed(2);
   $("resets").textContent = new Date(s.resets + "T00:00:00Z").toLocaleDateString(undefined, { month: "short", day: "numeric", timeZone: "UTC" });
   $("lastReport").textContent = srv.last_report ? "server reported " + ago(srv.last_report) : "";
-  $("noUsers").classList.toggle("hide", s.users.length > 0);
-  $("users").innerHTML = s.users.map(u => {
+  const shown = s.users.filter(u => !q || u.name.includes(q));
+  $("uCount").textContent = s.users.length || "";
+  $("noUsers").textContent = s.users.length ? "No users match your search." : "No users yet. Add some, then send each one their username and password.";
+  $("noUsers").classList.toggle("hide", shown.length > 0);
+  $("users").innerHTML = shown.map(u => {
     const pct = u.limit_gb ? Math.min(100, u.used / (u.limit_gb * 1e9) * 100) : 0;
     const barCls = pct >= 100 ? "full" : pct >= 80 ? "warn" : "";
     const status = !u.enabled ? '<span class="pill off">Off</span>' : u.blocked ? '<span class="pill bad">Limit reached</span>' : '<span class="pill on">Active</span>';
     const lim = u.limit_gb ? gb(u.used) + " of " + u.limit_gb + " GB" : gb(u.used) + " GB · no limit";
     const n = esc(u.name);
-    return `<tr><td><b>${n}</b></td>
+    return `<tr><td><b class="mono">${n}</b></td>
       <td><span class="small">${lim}</span>${u.limit_gb ? `<div class="bar ${barCls}"><i style="width:${pct}%"></i></div>` : ""}</td>
       <td>${status}</td>
       <td><div class="actions">
@@ -292,11 +312,32 @@ $("limitForm").onsubmit = async e => {
 $("addBtn").onclick = () => { $("addErr").textContent = ""; $("aName").value = ""; $("aLimit").value = 10; $("addDlg").showModal(); $("aName").focus(); };
 $("addForm").onsubmit = async e => {
   e.preventDefault(); $("addErr").textContent = "";
-  try {
-    const r = await api("POST", "/api/admin/users", { name: $("aName").value, limit_gb: Number($("aLimit").value) || 0 });
-    $("addDlg").close(); showPassword("Send these to " + r.name, r.name, r.password); await load();
-  } catch (err) { $("addErr").textContent = err.message; }
+  const names = $("aName").value.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+  const limit = Number($("aLimit").value) || 0, made = [], failed = [];
+  if (limit < 0) { $("addErr").textContent = "The limit can't be below 0."; return; }
+  $("addGo").disabled = true;
+  for (const [i, name] of names.entries()) {
+    $("addGo").textContent = names.length > 1 ? `Adding ${i + 1} of ${names.length}` : "Adding";
+    try { made.push(await api("POST", "/api/admin/users", { name, limit_gb: limit })); }
+    catch (err) { failed.push(name + ": " + err.message); }
+  }
+  $("addGo").disabled = false; $("addGo").textContent = "Add";
+  if (!made.length) { $("addErr").textContent = failed.join("\n"); return; }
+  $("addDlg").close();
+  if (made.length === 1 && !failed.length) showPassword("Send these to " + made[0].name, made[0].name, made[0].password);
+  else showBulk(made, failed);
+  await load();
 };
+
+function showBulk(made, failed) {
+  $("bulkTitle").textContent = `Added ${made.length} user${made.length === 1 ? "" : "s"}` + (failed.length ? `, ${failed.length} not added` : "");
+  $("bulkRows").innerHTML = made.map(r => `<tr><td class="mono">${esc(r.name)}</td><td class="mono">${esc(r.password)}</td></tr>`).join("")
+    + failed.map(f => `<tr><td colspan="2" class="err">${esc(f)}</td></tr>`).join("");
+  const csv = "username,password\n" + made.map(r => r.name + "," + r.password).join("\n") + "\n";
+  $("bulkCsv").onclick = () => { const link = document.createElement("a"); link.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" })); link.download = "cloudlabs-users.csv"; link.click(); };
+  $("bulkCopy").onclick = () => navigator.clipboard.writeText(csv).then(() => toast("Copied"));
+  $("bulkDlg").showModal();
+}
 
 $("settingsForm").onsubmit = async e => {
   e.preventDefault();
