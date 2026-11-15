@@ -17,8 +17,8 @@ using CloudLabsVPN.Shared;
 
 [assembly: System.Reflection.AssemblyTitle("CloudLabs-VPN Admin")]
 [assembly: System.Reflection.AssemblyProduct("CloudLabs-VPN")]
-[assembly: System.Reflection.AssemblyVersion("1.1.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.1.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.2.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.2.0.0")]
 
 namespace CloudLabsVPN.Admin
 {
@@ -727,6 +727,7 @@ namespace CloudLabsVPN.Admin
                 add(Path.Combine(Paths.ClientLinux, "README.txt"), "README.txt", false);
                 foreach (var f in app) add(f, "app/" + Path.GetFileName(f), !f.EndsWith(".so"));
                 add(Path.Combine(Paths.EngineLinux, "LICENSE"), "app/LICENSE", false);
+                add(Path.Combine(Paths.ClientLinux, "cloudlabs-vpn.svg"), "app/cloudlabs-vpn.svg", false);
                 using (var w = new StreamWriter(zip.CreateEntry("CloudLabs-VPN-Linux/app/api.json").Open(), new UTF8Encoding(false)))
                     w.Write(Json.Write(new Dictionary<string, object> { { "api", Store.PanelUrl } }));
             }

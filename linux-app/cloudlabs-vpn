@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """CloudLabs-VPN for Linux. Made by Alaa Aladdin.
 
+  cloudlabs-vpn gui                  open the CloudLabs-VPN window
   cloudlabs-vpn login [username]     sign in with the username and password you were given
   cloudlabs-vpn connect              full VPN: all traffic goes through it (asks for sudo)
   cloudlabs-vpn connect --proxy      no admin rights needed: a local proxy for your browser and terminal
@@ -8,14 +9,18 @@
   cloudlabs-vpn status               connection, usage and limit
   cloudlabs-vpn logout
 """
-import getpass, json, os, signal, subprocess, sys, time, urllib.error, urllib.request
+import getpass, json, os, secrets, shutil, signal, subprocess, sys, threading, time, urllib.error, urllib.request, webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 APP = os.path.dirname(os.path.realpath(__file__))
 SING_BOX = os.path.join(APP, "sing-box")
 STATE = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "cloudlabs-vpn")
-SESSION, CONFIG, RUN, LOG = (os.path.join(STATE, f) for f in ("session.json", "config.json", "running.json", "cloudlabs.log"))
+SESSION, CONFIG, RUN, LOG, STOP, GUI = (os.path.join(STATE, f) for f in
+                                        ("session.json", "config.json", "running.json", "cloudlabs.log", "stop", "gui.json"))
 PROXY_PORT = 2080
 UA = "CloudLabs-VPN-linux"
+# runs sing-box as root and stops it when the user (who can't signal a root process) creates the stop file
+ROOT_RUN = '"$1" run -c "$2" -D "$3" & p=$!; while kill -0 $p 2>/dev/null; do [ -e "$4" ] && kill $p; sleep 0.5; done'
 
 
 class Fail(Exception):
@@ -69,6 +74,13 @@ def read_json(path):
         return {}
 
 
+def remove(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
 def token():
     t = read_json(SESSION).get("token")
     if not t:
@@ -79,19 +91,11 @@ def token():
 def me():
     status, data = call("GET", "/api/me", token())
     if status in (401, 403):
-        forget()
-        raise Fail(err(status, data) + " Sign in again: cloudlabs-vpn login")
+        sign_out()
+        raise Fail(err(status, data) + " Sign in again.")
     if status != 200:
         raise Fail(err(status, data))
     return data
-
-
-def forget():
-    for p in (SESSION, CONFIG):
-        try:
-            os.remove(p)
-        except OSError:
-            pass
 
 
 def gb(n):
@@ -101,7 +105,7 @@ def gb(n):
 # ------------------------------------------------------------------ engine
 
 def build_config(vpn, proxy_mode):
-    """Same settings as the Windows app; --proxy swaps the tunnel for a local proxy."""
+    """Same settings as the Windows app; proxy mode swaps the tunnel for a local proxy."""
     if proxy_mode:
         inbound = {"type": "mixed", "tag": "proxy-in", "listen": "127.0.0.1", "listen_port": PROXY_PORT}
     else:
@@ -134,49 +138,142 @@ def running():
     return r if r.get("pid") and alive(r["pid"]) else None
 
 
-def seen_ip(proxy_mode):
+def seen_ip(proxy_mode, timeout=8):
     """The public IP the internet sees, through the proxy in proxy mode."""
     handler = urllib.request.ProxyHandler({"https": "http://127.0.0.1:%d" % PROXY_PORT} if proxy_mode else {})
     req = urllib.request.Request("https://1.1.1.1/cdn-cgi/trace", headers={"User-Agent": UA})
-    with urllib.request.build_opener(handler).open(req, timeout=8) as r:
+    with urllib.request.build_opener(handler).open(req, timeout=timeout) as r:
         return dict(l.split("=", 1) for l in r.read().decode().splitlines() if "=" in l).get("ip", "")
 
 
+def can_full():
+    """How the full VPN gets admin rights from the window: already root, or the desktop's password prompt."""
+    return os.geteuid() == 0 or bool(shutil.which("pkexec"))
+
+
 def stop(r):
-    try:
-        os.kill(r["pid"], signal.SIGTERM)
-    except PermissionError:  # full VPN runs as root
-        subprocess.run(["sudo", "kill", str(r["pid"])], check=False)
-    except ProcessLookupError:
-        pass
-    for _ in range(50):
+    if r.get("root"):
+        open(STOP, "w").close()
+    else:
+        try:
+            os.kill(r["pid"], signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    for _ in range(80):
         if not alive(r["pid"]):
             break
         time.sleep(0.1)
-    try:
-        os.remove(RUN)
-    except OSError:
-        pass
+    remove(RUN)
+    remove(STOP)
 
 
-# ------------------------------------------------------------------ commands
+def connect(proxy_mode, gui=False, say=print):
+    """Starts the VPN and returns the IP the internet now sees. gui=True asks for admin rights with the desktop prompt."""
+    if running():
+        raise Fail("Already connected. Disconnect first.")
+    if not os.access(SING_BOX, os.X_OK):
+        raise Fail("sing-box is missing from %s. Reinstall CloudLabs-VPN." % APP)
+    m = me()
+    if m.get("blocked"):
+        raise Fail("You've used all your data for this month. It resets on %s." % m.get("resets", "the 1st"))
+    state = m.get("server", {}).get("state")
+    if state != "running":
+        if state == "stopped" and m.get("allow_wake"):
+            status, data = call("POST", "/api/wake", token(), {})
+            if status != 200:
+                raise Fail(err(status, data))
+        elif state == "stopped":
+            raise Fail("The VPN server is paused. Ask your instructor to start it.")
+        say("Waiting for the VPN server to start (up to 3 minutes)...")
+        for _ in range(36):
+            time.sleep(5)
+            m = me()
+            if m.get("server", {}).get("state") == "running":
+                break
+        else:
+            raise Fail("The VPN server didn't start. Try again in a minute.")
+    vpn = m.get("vpn", {})
+    if not vpn.get("server") or not vpn.get("uuid"):
+        raise Fail("Couldn't get your VPN settings yet. Try again in a minute.")
+    write_private(CONFIG, build_config(vpn, proxy_mode))
+    remove(STOP)
 
-def cmd_login(args):
-    user = (args[0] if args else input("Username: ")).strip().lower()
-    password = getpass.getpass("Password: ")
-    status, data = call("POST", "/api/login", body={"username": user, "password": password})
+    root = not proxy_mode and os.geteuid() != 0
+    cmd, wait = [SING_BOX, "run", "-c", CONFIG, "-D", STATE], 15
+    if root:
+        if gui:
+            if not shutil.which("pkexec"):
+                raise Fail("The full VPN needs admin rights, and this PC has no admin prompt. Use Proxy mode instead.")
+            say("Enter your computer password in the window that opens.")
+            pre, wait = ["pkexec"], 120  # time to type the password
+        else:
+            print("The full VPN needs admin rights. (No sudo? Use: cloudlabs-vpn connect --proxy)")
+            if subprocess.run(["sudo", "-v"]).returncode != 0:
+                raise Fail("No admin rights. Use: cloudlabs-vpn connect --proxy")
+            pre = ["sudo", "-n"]
+        cmd = pre + [shutil.which("sh") or "/bin/sh", "-c", ROOT_RUN, "cloudlabs-vpn", SING_BOX, CONFIG, STATE, STOP]
+    with open(LOG, "ab") as log:
+        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+    # sudo/pkexec stay alive exactly as long as sing-box, so their pid is the one to watch
+    write_private(RUN, {"pid": p.pid, "proxy": proxy_mode, "root": root, "server": vpn["server"]})
+
+    ip, deadline = "", time.time() + wait
+    while time.time() < deadline:
+        if p.poll() is not None:
+            remove(RUN)
+            if root and p.returncode in (126, 127):
+                raise Fail("Admin password cancelled. Use Proxy mode if you don't have admin rights.")
+            raise Fail("The VPN engine stopped right away. Details: " + LOG)
+        try:
+            ip = seen_ip(proxy_mode, timeout=4)
+            if ip == vpn["server"]:
+                say("Connected.")
+                return ip
+        except OSError:
+            pass
+        time.sleep(1)
+    stop(read_json(RUN) or {"pid": p.pid})
+    raise Fail("Started the engine, but traffic isn't going through the VPN%s. Details: %s" % (" (seen IP %s)" % ip if ip else "", LOG))
+
+
+def disconnect():
+    r = running()
+    if r:
+        stop(r)
+    return bool(r)
+
+
+def sign_in(user, password):
+    status, data = call("POST", "/api/login", body={"username": user.strip().lower(), "password": password})
     if status != 200:
         raise Fail(err(status, data))
     write_private(SESSION, {"token": data["token"], "name": data.get("name", user)})
-    print("Signed in as %s." % data.get("name", user))
+    return data.get("name", user)
+
+
+def sign_out():
+    disconnect()
+    for p in (SESSION, CONFIG):
+        remove(p)
+
+
+# ------------------------------------------------------------------ terminal commands
+
+def proxy_help():
+    return ("Only apps that use the proxy go through the VPN. For this terminal (AWS CLI, curl, git, pip):\n"
+            "  export HTTPS_PROXY=http://127.0.0.1:%d HTTP_PROXY=http://127.0.0.1:%d ALL_PROXY=socks5h://127.0.0.1:%d\n"
+            "In your browser, set the proxy to 127.0.0.1 port %d, or start one with it:\n"
+            "  google-chrome --proxy-server=http://127.0.0.1:%d" % ((PROXY_PORT,) * 5))
+
+
+def cmd_login(args):
+    user = args[0] if args else input("Username: ")
+    print("Signed in as %s." % sign_in(user, getpass.getpass("Password: ")))
     cmd_status([])
 
 
 def cmd_logout(args):
-    r = running()
-    if r:
-        stop(r)
-    forget()
+    sign_out()
     print("Signed out.")
 
 
@@ -194,78 +291,392 @@ def cmd_status(args):
 
 def cmd_connect(args):
     proxy_mode = "--proxy" in args
-    if running():
-        raise Fail("Already connected. Run cloudlabs-vpn disconnect first.")
-    if not os.access(SING_BOX, os.X_OK):
-        raise Fail("sing-box is missing from %s. Reinstall CloudLabs-VPN." % APP)
-    m = me()
-    if m.get("blocked"):
-        raise Fail("You've used all your data for this month. It resets on %s." % m.get("resets", "the 1st"))
-    state = m.get("server", {}).get("state")
-    if state != "running":
-        if state == "stopped" and m.get("allow_wake"):
-            status, data = call("POST", "/api/wake", token(), {})
-            if status != 200:
-                raise Fail(err(status, data))
-        elif state == "stopped":
-            raise Fail("The VPN server is paused. Ask your instructor to start it.")
-        print("Waiting for the VPN server to start (up to 3 minutes)...")
-        for _ in range(36):
-            time.sleep(5)
-            m = me()
-            if m.get("server", {}).get("state") == "running":
-                break
-        else:
-            raise Fail("The VPN server didn't start. Try again in a minute.")
-    vpn = m.get("vpn", {})
-    if not vpn.get("server") or not vpn.get("uuid"):
-        raise Fail("Couldn't get your VPN settings yet. Try again in a minute.")
-    write_private(CONFIG, build_config(vpn, proxy_mode))
-
-    cmd = [SING_BOX, "run", "-c", CONFIG, "-D", STATE]
-    if not proxy_mode and os.geteuid() != 0:
-        print("The full VPN needs admin rights. (No sudo? Use: cloudlabs-vpn connect --proxy)")
-        if subprocess.run(["sudo", "-v"]).returncode != 0:
-            raise Fail("No admin rights. Use: cloudlabs-vpn connect --proxy")
-        cmd = ["sudo", "-n"] + cmd
-    with open(LOG, "ab") as log:
-        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
-    time.sleep(2)
-    if p.poll() is not None:
-        raise Fail("The VPN engine stopped right away. Details: " + LOG)
-    # sudo runs sing-box as its child and passes our kill on to it, so sudo's pid is the one to stop
-    write_private(RUN, {"pid": p.pid, "proxy": proxy_mode, "server": vpn["server"]})
-
-    ip = ""
-    for _ in range(5):
-        try:
-            ip = seen_ip(proxy_mode)
-            if ip == vpn["server"]:
-                break
-        except OSError:
-            pass
-        time.sleep(2)
-    if ip != vpn["server"]:
-        stop({"pid": p.pid})
-        raise Fail("Connected to the engine, but traffic isn't going through the VPN%s. Details: %s" % (" (seen IP %s)" % ip if ip else "", LOG))
+    ip = connect(proxy_mode, say=lambda s: None if s == "Connected." else print(s))
     print("Connected. The internet now sees you as %s." % ip)
     if proxy_mode:
-        print("\nOnly apps that use the proxy go through the VPN. For this terminal (AWS CLI, curl, git, pip):\n"
-              "  export HTTPS_PROXY=http://127.0.0.1:%d HTTP_PROXY=http://127.0.0.1:%d ALL_PROXY=socks5h://127.0.0.1:%d\n"
-              "In your browser, set the proxy to 127.0.0.1 port %d, or start one with it:\n"
-              "  google-chrome --proxy-server=http://127.0.0.1:%d" % ((PROXY_PORT,) * 5))
+        print("\n" + proxy_help())
 
 
 def cmd_disconnect(args):
-    r = running()
-    if not r:
-        print("Not connected.")
+    print("Disconnected." if disconnect() else "Not connected.")
+
+
+# ------------------------------------------------------------------ window (a local page in the browser)
+
+class Gui:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.busy, self.error, self.me, self.me_at, self.offline = "", "", None, 0, False
+
+    def state(self):
+        signed_in = bool(read_json(SESSION).get("token"))
+        if signed_in and time.time() - self.me_at > (5 if self.busy else 15):
+            self.me_at = time.time()
+            try:
+                self.me, self.offline = me(), False
+            except Fail as e:
+                if not read_json(SESSION).get("token"):  # the server signed us out
+                    self.me, self.error, signed_in = None, str(e), False
+                else:
+                    self.offline = True
+        r = running()
+        return {"signed_in": signed_in, "busy": self.busy, "error": self.error, "offline": self.offline, "me": self.me if signed_in else None,
+                "connected": {"proxy": r["proxy"], "server": r.get("server", "")} if r else None,
+                "can_full": can_full(), "proxy_port": PROXY_PORT}
+
+    def run(self, label, fn):
+        """Long actions run in the background; the page polls state() to follow them."""
+        with self.lock:
+            if self.busy:
+                return
+            self.busy, self.error = label, ""
+
+        def work():
+            try:
+                fn()
+            except Fail as e:
+                self.error = str(e)
+            except Exception as e:  # keep the window alive whatever happens
+                self.error = "Something went wrong: %s" % e
+            finally:
+                self.busy, self.me_at = "", 0
+        threading.Thread(target=work, daemon=True).start()
+
+    def say(self, text):
+        self.busy = text
+
+
+def open_window(url):
+    for b in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "microsoft-edge", "brave-browser"):
+        if shutil.which(b):  # an app-style window without tabs or address bar
+            subprocess.Popen([b, "--app=" + url, "--window-size=440,780"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+            return
+    webbrowser.open(url)
+
+
+def ping(info):
+    req = urllib.request.Request("http://127.0.0.1:%d/api/ping" % info["port"], headers={"X-Token": info["token"]})
+    try:
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=2) as r:
+            return r.status == 200
+    except (OSError, ValueError):
+        return False
+
+
+def cmd_gui(args):
+    info = read_json(GUI)
+    if info.get("port") and ping(info):  # already open: just show it again
+        open_window("http://127.0.0.1:%d/#%s" % (info["port"], info["token"]))
         return
-    stop(r)
-    print("Disconnected.")
+    gui, key = Gui(), secrets.token_urlsafe(24)
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def reply(self, code, body, ctype="application/json"):
+            data = body if isinstance(body, bytes) else json.dumps(body).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Security-Policy", "default-src 'self' 'unsafe-inline'; font-src https://fonts.gstatic.com; "
+                             "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com")
+            self.end_headers()
+            self.wfile.write(data)
+
+        def allowed(self):
+            # the key travels in a custom header, so other websites can't drive this (their requests can't set it)
+            return self.headers.get("Host") == "127.0.0.1:%d" % port and secrets.compare_digest(self.headers.get("X-Token", ""), key)
+
+        def do_GET(self):
+            if self.path == "/":
+                return self.reply(200, PAGE.encode(), "text/html; charset=utf-8")
+            if not self.allowed():
+                return self.reply(403, {"error": "forbidden"})
+            if self.path == "/api/ping":
+                return self.reply(200, {"ok": True})
+            if self.path == "/api/state":
+                return self.reply(200, gui.state())
+            self.reply(404, {"error": "not found"})
+
+        def do_POST(self):
+            if not self.allowed():
+                return self.reply(403, {"error": "forbidden"})
+            try:
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+            except ValueError:
+                body = {}
+            if self.path == "/api/login":
+                try:
+                    sign_in(str(body.get("username", "")), str(body.get("password", "")))
+                    gui.error, gui.me_at = "", 0
+                    return self.reply(200, gui.state())
+                except Fail as e:
+                    return self.reply(400, {"error": str(e)})
+            if self.path == "/api/connect":
+                gui.run("Connecting...", lambda: connect(bool(body.get("proxy")), gui=True, say=gui.say))
+            elif self.path == "/api/disconnect":
+                gui.run("Disconnecting...", disconnect)
+            elif self.path == "/api/logout":
+                gui.run("Signing out...", sign_out)
+            elif self.path == "/api/quit":
+                threading.Thread(target=httpd.shutdown, daemon=True).start()
+            else:
+                return self.reply(404, {"error": "not found"})
+            self.reply(200, gui.state())
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    port = httpd.server_address[1]
+    write_private(GUI, {"port": port, "token": key})
+    url = "http://127.0.0.1:%d/#%s" % (port, key)  # the key sits after '#', so it never reaches a server or a log
+    open_window(url)
+    print("CloudLabs-VPN is open in your browser: %s\nClosing the window keeps the VPN as it is. Quit from the window, or press Ctrl+C here." % url)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        remove(GUI)
 
 
-COMMANDS = {"login": cmd_login, "logout": cmd_logout, "status": cmd_status, "connect": cmd_connect, "disconnect": cmd_disconnect}
+PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CloudLabs-VPN</title>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600&family=Barlow+Condensed:wght@500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#0f2740;--card:#15324f;--field:#0c2035;--ink:#eaf4ff;--muted:#8fb0cf;--line:#24496f;--soft:#1b3b5c;--grid:#183656;
+--accent:#ff8a4c;--accent-h:#ffa676;--on-accent:#2a1205;--warn:#ffd166;--bad:#ff6b7f;--grey:#6886a6;--busy:#5cc8ff;
+--display:"Barlow Condensed","Bahnschrift","DejaVu Sans Condensed","Arial Narrow",sans-serif;--body:"Barlow","Segoe UI","Ubuntu","Cantarell","DejaVu Sans",sans-serif}
+*{box-sizing:border-box}
+html,body{margin:0;min-height:100%;background:var(--bg);color:var(--ink);font:15px/1.45 var(--body)}
+body{background-image:linear-gradient(var(--grid) 1px,transparent 1px),linear-gradient(90deg,var(--grid) 1px,transparent 1px);background-size:24px 24px;background-position:-1px -1px}
+.wrap{max-width:420px;margin:0 auto;padding:20px 16px 18px;display:flex;flex-direction:column;min-height:100vh}
+header{display:flex;align-items:center;gap:10px;margin-bottom:18px}
+header svg{flex:none}
+.brand{font:700 22px/1 var(--display);letter-spacing:.04em;text-transform:uppercase}
+.brand small{display:block;font:500 12px/1.4 var(--body);letter-spacing:.02em;text-transform:none;color:var(--muted)}
+.pill{margin-left:auto;font:600 12px/1 var(--display);letter-spacing:.08em;text-transform:uppercase;padding:6px 9px;border-radius:999px;border:1px solid var(--line);color:var(--muted);background:var(--field)}
+.pill.on{color:var(--accent);border-color:var(--accent)}.pill.wait{color:var(--busy);border-color:var(--busy)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:12px}
+h1{font:700 26px/1.1 var(--display);letter-spacing:.03em;text-transform:uppercase;margin:0 0 4px}
+.sub{color:var(--muted);margin:0 0 16px}
+label{display:block;font:600 12px/1 var(--display);letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin:14px 0 6px}
+input{width:100%;background:var(--field);border:1px solid var(--line);border-radius:8px;color:var(--ink);font:15px var(--body);padding:11px 12px;outline:none}
+input:focus{border-color:var(--accent)}
+.pwrow{position:relative}.pwrow input{padding-right:64px}
+.link{background:none;border:0;color:var(--accent);font:600 13px var(--body);cursor:pointer;padding:4px}
+.link:hover{color:var(--accent-h)}.link:focus-visible,.btn:focus-visible,.seg button:focus-visible,.power:focus-visible{outline:2px solid var(--busy);outline-offset:2px}
+.pwrow .link{position:absolute;right:6px;top:50%;transform:translateY(-50%)}
+.btn{display:block;width:100%;margin-top:18px;border:0;border-radius:8px;background:var(--accent);color:var(--on-accent);font:700 17px/1 var(--display);letter-spacing:.08em;text-transform:uppercase;padding:14px;cursor:pointer}
+.btn:hover{background:var(--accent-h)}.btn:disabled{background:var(--soft);color:var(--muted);cursor:default}
+.banner{border-radius:10px;padding:11px 13px;margin-bottom:12px;background:var(--card);border:1px solid var(--bad);color:var(--ink);font-size:14px}
+.banner.warn{border-color:var(--warn)}.banner b{color:var(--bad)}.banner.warn b{color:var(--warn)}
+.stage{display:flex;flex-direction:column;align-items:center;padding:10px 16px 16px}
+.power{position:relative;width:208px;height:208px;border:0;background:none;padding:0;cursor:pointer;border-radius:50%}
+.power:disabled{cursor:default}
+.power svg{position:absolute;inset:0}
+.power .core{position:absolute;inset:34px;border-radius:50%;background:var(--field);border:2px solid var(--line);display:flex;align-items:center;justify-content:center;transition:all .25s}
+.power .core svg{position:static}
+.power.on .core{border-color:var(--accent);box-shadow:0 0 40px -6px var(--accent),inset 0 0 26px -10px var(--accent)}
+.power.wait .core{border-color:var(--busy);box-shadow:0 0 34px -8px var(--busy)}
+.power:not(:disabled):hover .core{border-color:var(--accent-h)}
+.power.wait .ticks{animation:spin 2.4s linear infinite;transform-origin:104px 104px}
+@keyframes spin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){.power.wait .ticks{animation:none}}
+.status{font:700 24px/1.1 var(--display);letter-spacing:.05em;text-transform:uppercase;margin-top:10px;text-align:center}
+.status.on{color:var(--accent)}.status.wait{color:var(--busy)}
+.detail{color:var(--muted);font-size:14px;text-align:center;min-height:21px;margin-top:2px}
+.seg{display:grid;grid-template-columns:1fr 1fr;background:var(--field);border:1px solid var(--line);border-radius:9px;padding:3px;margin-top:16px;width:100%}
+.seg button{border:0;background:none;color:var(--muted);font:600 14px/1.2 var(--display);letter-spacing:.06em;text-transform:uppercase;padding:9px 6px;border-radius:7px;cursor:pointer}
+.seg button small{display:block;font:500 11px/1.3 var(--body);letter-spacing:0;text-transform:none}
+.seg button.sel{background:var(--soft);color:var(--ink);box-shadow:inset 0 0 0 1px var(--line)}
+.seg button:disabled{cursor:default;opacity:.55}
+.k{font:600 12px/1 var(--display);letter-spacing:.1em;text-transform:uppercase;color:var(--muted)}
+.usage{display:flex;align-items:baseline;justify-content:space-between;margin:8px 0 10px}
+.usage b{font:700 30px/1 var(--display);letter-spacing:.02em}.usage span{color:var(--muted);font-size:14px}
+.bar{height:8px;border-radius:99px;background:var(--field);border:1px solid var(--line);overflow:hidden}
+.bar i{display:block;height:100%;width:0;background:var(--accent);border-radius:99px;transition:width .4s}
+.bar.hi i{background:var(--warn)}.bar.full i{background:var(--bad)}
+.meta{display:flex;justify-content:space-between;color:var(--muted);font-size:13px;margin-top:9px}
+.meta em{font-style:normal;color:var(--ink)}
+.code{display:flex;gap:8px;align-items:center;background:var(--field);border:1px solid var(--line);border-radius:8px;padding:8px 8px 8px 10px;margin:8px 0;font:12.5px/1.4 ui-monospace,"DejaVu Sans Mono",monospace;word-break:break-all}
+.code span{flex:1}
+.small{color:var(--muted);font-size:13px;margin:0}
+footer{padding-top:14px;display:flex;align-items:center;justify-content:space-between;color:var(--muted);font-size:13px}
+footer .who b{color:var(--ink);font-weight:600}
+.credit{text-align:center;color:var(--grey);font-size:11px;letter-spacing:.04em;margin-top:10px}
+[hidden]{display:none!important}
+</style></head><body><div class="wrap">
+<header>
+  <svg width="34" height="38" viewBox="0 0 34 38" aria-hidden="true"><path d="M17 1 32 7v11c0 9.5-6.4 16.4-15 19C8.4 34.4 2 27.5 2 18V7z" fill="#15324f" stroke="#ff8a4c" stroke-width="2"/><path d="M11 17h12M17 11v12" stroke="#ff8a4c" stroke-width="2.4" stroke-linecap="round" opacity=".9"/></svg>
+  <div class="brand">CloudLabs-VPN<small>Cloud Computing labs</small></div>
+  <span class="pill" id="pill">Off</span>
+</header>
+<div id="banners"></div>
+
+<section id="signin" hidden>
+  <div class="card">
+    <h1>Sign in</h1>
+    <p class="sub">Use the username and password your instructor gave you.</p>
+    <form id="form" autocomplete="on">
+      <label for="user">Username</label>
+      <input id="user" autocomplete="username" autocapitalize="off" spellcheck="false" required>
+      <label for="pw">Password</label>
+      <div class="pwrow"><input id="pw" type="password" autocomplete="current-password" required><button type="button" class="link" id="show">Show</button></div>
+      <button class="btn" id="go">Sign in</button>
+    </form>
+  </div>
+</section>
+
+<section id="home" hidden>
+  <div class="card stage">
+    <button class="power" id="power" aria-label="Connect">
+      <svg viewBox="0 0 208 208" aria-hidden="true"><g class="ticks" id="ticks"></g></svg>
+      <span class="core"><svg width="54" height="54" viewBox="0 0 54 54" aria-hidden="true"><path id="glyph" d="M18 14a17 17 0 1 0 18 0M27 6v20" fill="none" stroke="#6886a6" stroke-width="4.5" stroke-linecap="round"/></svg></span>
+    </button>
+    <div class="status" id="status">Not connected</div>
+    <div class="detail" id="detail"></div>
+    <div class="seg" role="group" aria-label="Connection type">
+      <button id="mFull" type="button">Full VPN<small>All traffic &middot; needs admin</small></button>
+      <button id="mProxy" type="button">Proxy<small>Browser + terminal &middot; no admin</small></button>
+    </div>
+  </div>
+  <div class="card" id="proxyCard" hidden>
+    <div class="k">Use the proxy</div>
+    <p class="small" style="margin-top:8px">Only apps set to use it go through the VPN. Paste this in your terminal for the AWS CLI, curl, git and pip:</p>
+    <div class="code"><span id="exp"></span><button class="link" id="copy">Copy</button></div>
+    <p class="small">Browser: set the proxy to <b style="color:var(--ink)">127.0.0.1</b> port <b style="color:var(--ink)" id="port"></b>, or start Chrome with <span style="font-family:ui-monospace,monospace" id="chrome"></span></p>
+  </div>
+  <div class="card">
+    <div class="k">This month</div>
+    <div class="usage"><b id="used">&ndash;</b><span id="limit"></span></div>
+    <div class="bar" id="bar"><i id="fill"></i></div>
+    <div class="meta"><span>Resets <em id="resets">&ndash;</em></span><span>Server <em id="server">&ndash;</em></span></div>
+  </div>
+</section>
+
+<div style="flex:1"></div>
+<footer id="foot" hidden><span class="who">Signed in as <b id="who"></b></span><span><button class="link" id="out">Sign out</button><button class="link" id="quit">Quit</button></span></footer>
+<div class="credit">Made by Alaa Aladdin</div>
+</div>
+<script>
+const key = location.hash.slice(1);
+const $ = id => document.getElementById(id);
+let S = null, mode = null, timer = null;
+try { mode = localStorage.getItem("mode"); } catch (e) {}
+
+async function api(path, body) {
+  const r = await fetch(path, body === undefined ? {headers: {"X-Token": key}} :
+    {method: "POST", headers: {"X-Token": key, "Content-Type": "application/json"}, body: JSON.stringify(body)});
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || ("HTTP " + r.status));
+  return d;
+}
+function gb(n) { return (n / 1e9).toFixed(2); }
+function day(s) { const d = new Date(s + "T00:00:00"); return isNaN(d) ? (s || "the 1st") : d.toLocaleDateString(undefined, {month: "long", day: "numeric"}); }
+function banner(text, kind, title) {
+  const b = document.createElement("div"); b.className = "banner" + (kind ? " " + kind : "");
+  if (title) { const t = document.createElement("b"); t.textContent = title + " "; b.append(t); }
+  b.append(text); $("banners").append(b);
+}
+
+// gauge ticks around the power button
+(function () {
+  const g = $("ticks"), ns = "http://www.w3.org/2000/svg";
+  for (let i = 0; i < 60; i++) {
+    const a = i * 6 * Math.PI / 180, long = i % 5 === 0, r1 = long ? 88 : 92, r2 = 100;
+    const l = document.createElementNS(ns, "line");
+    l.setAttribute("x1", 104 + r1 * Math.sin(a)); l.setAttribute("y1", 104 - r1 * Math.cos(a));
+    l.setAttribute("x2", 104 + r2 * Math.sin(a)); l.setAttribute("y2", 104 - r2 * Math.cos(a));
+    l.setAttribute("stroke-width", long ? 2.4 : 1.3); l.setAttribute("stroke-linecap", "round");
+    g.append(l);
+  }
+})();
+
+function render() {
+  const s = S; if (!s) return;
+  $("banners").replaceChildren();
+  if (s.error) banner(s.error, "", "Problem:");
+  if (s.offline) banner("Can't reach the CloudLabs-VPN server right now. Showing your last known details.", "warn", "Offline.");
+  $("signin").hidden = s.signed_in; $("home").hidden = !s.signed_in; $("foot").hidden = !s.signed_in;
+  const on = !!s.connected, wait = !!s.busy, st = on ? "on" : wait ? "wait" : "";
+  $("pill").textContent = on ? (s.connected.proxy ? "Proxy on" : "VPN on") : wait ? "Working" : "Off";
+  $("pill").className = "pill " + st;
+  if (!s.signed_in) { $("go").disabled = false; return; }
+
+  const m = s.me || {};
+  $("who").textContent = m.name || "";
+  if (mode !== "full" && mode !== "proxy") mode = s.can_full ? "full" : "proxy";
+  if (on) mode = s.connected.proxy ? "proxy" : "full";
+  $("mFull").className = mode === "full" ? "sel" : ""; $("mProxy").className = mode === "proxy" ? "sel" : "";
+  $("mFull").disabled = $("mProxy").disabled = on || wait;
+  if (!s.can_full) { $("mFull").disabled = true; $("mFull").title = "This PC has no admin password prompt (pkexec), so use Proxy."; }
+
+  const server = (m.server || {}).state || "unknown";
+  const blocked = !!m.blocked, paused = server === "stopped" && !m.allow_wake;
+  if (blocked && !on) banner("You've used all your data for this month. It resets on " + day(m.resets) + ".", "", "Limit reached.");
+  else if (paused && !on) banner("The VPN server is paused. Ask your instructor to start it.", "warn", "Server paused.");
+
+  const p = $("power"); p.className = "power " + st;
+  p.disabled = wait || (!on && (blocked || paused));
+  p.setAttribute("aria-label", on ? "Disconnect" : "Connect");
+  const color = on ? "#ff8a4c" : wait ? "#5cc8ff" : "#6886a6";
+  $("ticks").setAttribute("stroke", on || wait ? color : "#24496f");
+  $("glyph").setAttribute("stroke", color);
+  $("status").textContent = on ? "Connected" : wait ? (s.busy.startsWith("Disconnect") ? "Disconnecting" : s.busy.startsWith("Signing") ? "Signing out" : "Connecting") : "Not connected";
+  $("status").className = "status " + st;
+  $("detail").textContent = wait ? s.busy : on ? (s.connected.proxy ? "Proxy on 127.0.0.1:" + s.proxy_port : "All traffic goes through the VPN") + " \u00b7 " + s.connected.server : "Tap to connect";
+
+  const port = s.proxy_port;
+  $("proxyCard").hidden = !(on && s.connected.proxy);
+  $("exp").textContent = `export HTTPS_PROXY=http://127.0.0.1:${port} HTTP_PROXY=http://127.0.0.1:${port} ALL_PROXY=socks5h://127.0.0.1:${port}`;
+  $("port").textContent = port; $("chrome").textContent = `google-chrome --proxy-server=http://127.0.0.1:${port}`;
+
+  const used = m.used || 0, lim = m.limit_gb || 0;
+  $("used").textContent = gb(used) + " GB";
+  $("limit").textContent = lim ? "of " + lim + " GB" : "no limit";
+  const pct = lim ? Math.min(100, used / (lim * 1e9) * 100) : 0;
+  $("fill").style.width = pct + "%";
+  $("bar").className = "bar" + (pct >= 100 ? " full" : pct >= 80 ? " hi" : "");
+  $("resets").textContent = day(m.resets);
+  $("server").textContent = server;
+}
+
+async function poll() {
+  clearTimeout(timer);
+  try { S = await api("/api/state"); render(); }
+  catch (e) { $("banners").replaceChildren(); banner("The CloudLabs-VPN app isn't running. Open it again from your apps menu.", "", "Closed."); }
+  timer = setTimeout(poll, S && S.busy ? 800 : 2500);
+}
+async function act(path, body) {
+  try { S = await api(path, body || {}); render(); } catch (e) { banner(e.message, "", "Problem:"); }
+  poll();
+}
+
+$("form").addEventListener("submit", async e => {
+  e.preventDefault(); $("go").disabled = true; $("go").textContent = "Signing in...";
+  try { S = await api("/api/login", {username: $("user").value, password: $("pw").value}); $("pw").value = ""; render(); }
+  catch (err) { $("banners").replaceChildren(); banner(err.message, "", "Couldn't sign in."); }
+  $("go").disabled = false; $("go").textContent = "Sign in";
+});
+$("show").onclick = () => { const p = $("pw"), h = p.type === "password"; p.type = h ? "text" : "password"; $("show").textContent = h ? "Hide" : "Show"; };
+$("power").onclick = () => S && (S.connected ? act("/api/disconnect") : act("/api/connect", {proxy: mode === "proxy"}));
+function pick(m) { mode = m; try { localStorage.setItem("mode", m); } catch (e) {} render(); }
+$("mFull").onclick = () => pick("full"); $("mProxy").onclick = () => pick("proxy");
+$("copy").onclick = async () => { try { await navigator.clipboard.writeText($("exp").textContent); $("copy").textContent = "Copied"; setTimeout(() => $("copy").textContent = "Copy", 1500); } catch (e) {} };
+$("out").onclick = () => act("/api/logout");
+$("quit").onclick = async () => {
+  if (S && S.connected && !confirm("Quit CloudLabs-VPN? The VPN stays connected until you open it again and disconnect.")) return;
+  try { await api("/api/quit", {}); } catch (e) {}
+  clearTimeout(timer); document.body.innerHTML = '<div class="wrap"><p class="sub" style="margin-top:40px;text-align:center">CloudLabs-VPN is closed. You can close this window.</p></div>';
+};
+poll();
+</script></body></html>
+"""
+
+COMMANDS = {"gui": cmd_gui, "login": cmd_login, "logout": cmd_logout, "status": cmd_status, "connect": cmd_connect, "disconnect": cmd_disconnect}
 
 
 def main(argv):
