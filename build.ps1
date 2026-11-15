@@ -44,11 +44,12 @@ if ($LASTEXITCODE -ne 0) { throw "CloudLabs-VPN Admin.exe failed to compile" }
 $running = Get-Process 'CloudLabs-VPN Admin' -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "$out\*" }
 if ($running) { $running | Stop-Process -Force; $running | Wait-Process -Timeout 10 -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 500 }
 if (Test-Path $out) { Remove-Item $out -Recurse -Force }
-New-Item -ItemType Directory -Force "$out\scripts", "$out\client" | Out-Null
+New-Item -ItemType Directory -Force "$out\scripts", "$out\client", "$out\client-linux" | Out-Null
 Copy-Item "$obj\CloudLabs-VPN Admin.exe" $out
 Copy-Item "$root\server\*.ps1", "$root\server\*.py", "$root\server\*.sh", "$root\server\panel.html" "$out\scripts\"
 Copy-Item "$obj\CloudLabs-VPN.exe" "$out\client\"
 Copy-Item "$root\windows-app\install.cmd", "$root\windows-app\install.ps1", "$root\windows-app\uninstall.cmd", "$root\windows-app\uninstall.ps1" "$out\client\"
+Copy-Item "$root\linux-app\*" "$out\client-linux\"
 "built: $out"
 
 # -Package: the zip for GitHub Releases. Unzip, run the admin app, deploy. sing-box is included (GPL-3.0, source: github.com/SagerNet/sing-box).
@@ -61,6 +62,9 @@ if ($Package) {
   $dir = Join-Path $stage 'CloudLabs-VPN Admin'
   Copy-Item $out $dir -Recurse
   Copy-Item $eng (Join-Path $dir 'engine') -Recurse
+  $engLinux = Join-Path $root 'data\engine-linux'
+  foreach ($f in 'sing-box', 'libcronet.so', 'LICENSE') { if (-not (Test-Path "$engLinux\$f")) { throw "Put the sing-box 1.14.4 linux-amd64 files in data\engine-linux first ($f is missing)." } }
+  Copy-Item $engLinux (Join-Path $dir 'engine-linux') -Recurse
   [IO.File]::WriteAllText((Join-Path $dir 'READ ME.txt'), @"
 CloudLabs-VPN Admin $ver
 

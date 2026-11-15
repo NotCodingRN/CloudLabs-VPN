@@ -36,7 +36,9 @@ That builds both apps into `D:\CloudLabs-VPN\app` and adds **CloudLabs-VPN Admin
    - downloading sing-box 1.14.4 and putting its files in the folder it shows you,
    - creating the VPN (5–10 minutes).
 2. At the end it shows your **admin panel link, username and generated password**. Open the panel and add users. Each new user gets a generated password to send them, and you add yourself the same way if you want to use the VPN.
-3. Click **Build installer…**. It saves `CloudLabs-VPN-Setup.zip` in the `installers` folder. Send it to your users. They unzip it, double-click `install.cmd` and sign in.
+3. Click **Build installer…**. It saves `CloudLabs-VPN-Setup.zip` in the `installers` folder, plus `CloudLabs-VPN-Setup-Linux.zip` for Linux users. Send the right one to each user.
+   - **Windows:** unzip it, double-click `install.cmd` and sign in.
+   - **Linux** (64-bit Intel/AMD, needs python3): unzip it, run `sh install.sh`, then `cloudlabs-vpn login` and `cloudlabs-vpn connect`. On lab PCs without sudo, `cloudlabs-vpn connect --proxy` runs it as a local proxy for the browser and terminal (`HTTPS_PROXY`), no admin rights needed. The release download includes the Linux files; in a cloned repo, put sing-box 1.14.4 linux-amd64 (`sing-box`, `libcronet.so`, `LICENSE`) in `data\engine-linux`.
 
 If you delete the folder, use **Delete everything** in the app first, or you lose the record of what to remove from AWS and it keeps billing.
 

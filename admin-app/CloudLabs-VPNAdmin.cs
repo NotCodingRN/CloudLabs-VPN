@@ -17,8 +17,8 @@ using CloudLabsVPN.Shared;
 
 [assembly: System.Reflection.AssemblyTitle("CloudLabs-VPN Admin")]
 [assembly: System.Reflection.AssemblyProduct("CloudLabs-VPN")]
-[assembly: System.Reflection.AssemblyVersion("1.0.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.0.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.1.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.1.0.0")]
 
 namespace CloudLabsVPN.Admin
 {
@@ -50,6 +50,8 @@ namespace CloudLabsVPN.Admin
         public static string Scripts { get { return Path.Combine(App, "scripts"); } }
         public static string Client { get { return Path.Combine(App, "client"); } }
         // releases ship sing-box in <app>\engine, a clone keeps it in data\engine
+        public static string ClientLinux { get { return Path.Combine(App, "client-linux"); } }
+        public static string EngineLinux { get { var bundled = Path.Combine(App, "engine-linux"); return Directory.Exists(bundled) ? bundled : Path.Combine(Data, "engine-linux"); } }
         public static string Engine { get { var bundled = Path.Combine(App, "engine"); return Directory.Exists(bundled) ? bundled : Path.Combine(Data, "engine"); } }
         public static string File(string name) { return Path.Combine(Data, name); }
     }
@@ -701,10 +703,32 @@ namespace CloudLabsVPN.Admin
                         "To remove it: double-click uninstall.cmd.\r\n");
                     if (File.Exists(dlg.FileName)) File.Delete(dlg.FileName);
                     ZipFile.CreateFromDirectory(stage, dlg.FileName);
+                    BuildLinuxClient(Path.Combine(Path.GetDirectoryName(dlg.FileName), Path.GetFileNameWithoutExtension(dlg.FileName) + "-Linux.zip"));
                     Process.Start("explorer.exe", "/select,\"" + dlg.FileName + "\"");
                 }
                 catch (Exception ex) { MessageBox.Show(this, "Couldn't build the installer: " + ex.Message, "CloudLabs-VPN Admin", MessageBoxButtons.OK, MessageBoxIcon.Error); }
                 finally { try { Directory.Delete(stage, true); } catch { } }
+            }
+        }
+
+        /// The Linux app, saved next to the Windows installer. Skipped quietly when the Linux files aren't there.
+        void BuildLinuxClient(string zipPath)
+        {
+            var app = new[] { Path.Combine(Paths.ClientLinux, "cloudlabs-vpn"), Path.Combine(Paths.EngineLinux, "sing-box"), Path.Combine(Paths.EngineLinux, "libcronet.so") };
+            if (app.Any(f => !File.Exists(f))) return;
+            if (File.Exists(zipPath)) File.Delete(zipPath);
+            // written by hand: Linux needs "/" in paths and the executable bit on the programs
+            using (var zip = ZipFile.Open(zipPath, ZipArchiveMode.Create))
+            {
+                Action<string, string, bool> add = (file, name, exe) =>
+                    zip.CreateEntryFromFile(file, "CloudLabs-VPN-Linux/" + name).ExternalAttributes = (exe ? 0x81ED : 0x81A4) << 16; // rwxr-xr-x / rw-r--r--
+                add(Path.Combine(Paths.ClientLinux, "install.sh"), "install.sh", true);
+                add(Path.Combine(Paths.ClientLinux, "uninstall.sh"), "uninstall.sh", true);
+                add(Path.Combine(Paths.ClientLinux, "README.txt"), "README.txt", false);
+                foreach (var f in app) add(f, "app/" + Path.GetFileName(f), !f.EndsWith(".so"));
+                add(Path.Combine(Paths.EngineLinux, "LICENSE"), "app/LICENSE", false);
+                using (var w = new StreamWriter(zip.CreateEntry("CloudLabs-VPN-Linux/app/api.json").Open(), new UTF8Encoding(false)))
+                    w.Write(Json.Write(new Dictionary<string, object> { { "api", Store.PanelUrl } }));
             }
         }
 

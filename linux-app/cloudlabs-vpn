@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+"""CloudLabs-VPN for Linux. Made by Alaa Aladdin.
+
+  cloudlabs-vpn login [username]     sign in with the username and password you were given
+  cloudlabs-vpn connect              full VPN: all traffic goes through it (asks for sudo)
+  cloudlabs-vpn connect --proxy      no admin rights needed: a local proxy for your browser and terminal
+  cloudlabs-vpn disconnect
+  cloudlabs-vpn status               connection, usage and limit
+  cloudlabs-vpn logout
+"""
+import getpass, json, os, signal, subprocess, sys, time, urllib.error, urllib.request
+
+APP = os.path.dirname(os.path.realpath(__file__))
+SING_BOX = os.path.join(APP, "sing-box")
+STATE = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "cloudlabs-vpn")
+SESSION, CONFIG, RUN, LOG = (os.path.join(STATE, f) for f in ("session.json", "config.json", "running.json", "cloudlabs.log"))
+PROXY_PORT = 2080
+UA = "CloudLabs-VPN-linux"
+
+
+class Fail(Exception):
+    pass
+
+
+def api_url():
+    try:
+        with open(os.path.join(APP, "api.json")) as f:
+            return json.load(f)["api"].rstrip("/")
+    except (OSError, ValueError, KeyError):
+        raise Fail("This copy of CloudLabs-VPN has no server address. Ask for a new installer.")
+
+
+def call(method, path, token=None, body=None):
+    """Returns (status, data). Network problems raise Fail."""
+    req = urllib.request.Request(api_url() + path, method=method, headers={"User-Agent": UA, "Content-Type": "application/json"},
+                                 data=None if body is None else json.dumps(body).encode())
+    if token:
+        req.add_header("Authorization", "Bearer " + token)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # talk to the server directly, never through our own proxy
+    try:
+        with opener.open(req, timeout=20) as r:
+            return r.status, json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        try:
+            data = json.loads(e.read() or b"{}")
+        except ValueError:
+            data = {}
+        return e.code, data
+    except (urllib.error.URLError, OSError) as e:
+        raise Fail("Can't reach the CloudLabs-VPN server. Check your internet. (%s)" % getattr(e, "reason", e))
+
+
+def err(status, data):
+    return data.get("error") or "The server said no (HTTP %d)." % status
+
+
+def write_private(path, obj):
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(obj, f)
+
+
+def read_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def token():
+    t = read_json(SESSION).get("token")
+    if not t:
+        raise Fail("You're not signed in. Run: cloudlabs-vpn login")
+    return t
+
+
+def me():
+    status, data = call("GET", "/api/me", token())
+    if status in (401, 403):
+        forget()
+        raise Fail(err(status, data) + " Sign in again: cloudlabs-vpn login")
+    if status != 200:
+        raise Fail(err(status, data))
+    return data
+
+
+def forget():
+    for p in (SESSION, CONFIG):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def gb(n):
+    return "%.2f GB" % (n / 1e9)
+
+
+# ------------------------------------------------------------------ engine
+
+def build_config(vpn, proxy_mode):
+    """Same settings as the Windows app; --proxy swaps the tunnel for a local proxy."""
+    if proxy_mode:
+        inbound = {"type": "mixed", "tag": "proxy-in", "listen": "127.0.0.1", "listen_port": PROXY_PORT}
+    else:
+        inbound = {"type": "tun", "tag": "tun-in", "interface_name": "cloudlabs-vpn", "address": ["172.20.0.1/30"],
+                   "mtu": 1400, "auto_route": True, "strict_route": True, "stack": "mixed"}
+    return {
+        "log": {"level": "warn", "timestamp": True},
+        "dns": {"servers": [{"type": "https", "tag": "dns-remote", "server": "1.1.1.1", "detour": "proxy"},
+                            {"type": "local", "tag": "dns-local"}],
+                "final": "dns-remote", "strategy": "ipv4_only"},
+        "inbounds": [inbound],
+        "outbounds": [
+            {"type": "vless", "tag": "proxy", "server": vpn["server"], "server_port": int(vpn["port"]), "uuid": vpn["uuid"],
+             "flow": "xtls-rprx-vision",
+             "tls": {"enabled": True, "server_name": vpn["sni"], "utls": {"enabled": True, "fingerprint": "chrome"},
+                     "reality": {"enabled": True, "public_key": vpn["public_key"], "short_id": vpn["short_id"]}}},
+            {"type": "direct", "tag": "direct"}],
+        "route": {"rules": [{"action": "sniff"}, {"protocol": "dns", "action": "hijack-dns"},
+                            {"ip_is_private": True, "outbound": "direct"}],
+                  "final": "proxy", "auto_detect_interface": True, "default_domain_resolver": "dns-local"},
+    }
+
+
+def alive(pid):
+    return os.path.exists("/proc/%d" % pid)
+
+
+def running():
+    r = read_json(RUN)
+    return r if r.get("pid") and alive(r["pid"]) else None
+
+
+def seen_ip(proxy_mode):
+    """The public IP the internet sees, through the proxy in proxy mode."""
+    handler = urllib.request.ProxyHandler({"https": "http://127.0.0.1:%d" % PROXY_PORT} if proxy_mode else {})
+    req = urllib.request.Request("https://1.1.1.1/cdn-cgi/trace", headers={"User-Agent": UA})
+    with urllib.request.build_opener(handler).open(req, timeout=8) as r:
+        return dict(l.split("=", 1) for l in r.read().decode().splitlines() if "=" in l).get("ip", "")
+
+
+def stop(r):
+    try:
+        os.kill(r["pid"], signal.SIGTERM)
+    except PermissionError:  # full VPN runs as root
+        subprocess.run(["sudo", "kill", str(r["pid"])], check=False)
+    except ProcessLookupError:
+        pass
+    for _ in range(50):
+        if not alive(r["pid"]):
+            break
+        time.sleep(0.1)
+    try:
+        os.remove(RUN)
+    except OSError:
+        pass
+
+
+# ------------------------------------------------------------------ commands
+
+def cmd_login(args):
+    user = (args[0] if args else input("Username: ")).strip().lower()
+    password = getpass.getpass("Password: ")
+    status, data = call("POST", "/api/login", body={"username": user, "password": password})
+    if status != 200:
+        raise Fail(err(status, data))
+    write_private(SESSION, {"token": data["token"], "name": data.get("name", user)})
+    print("Signed in as %s." % data.get("name", user))
+    cmd_status([])
+
+
+def cmd_logout(args):
+    r = running()
+    if r:
+        stop(r)
+    forget()
+    print("Signed out.")
+
+
+def cmd_status(args):
+    r = running()
+    print("Connection: " + (("connected, " + ("proxy on 127.0.0.1:%d" % PROXY_PORT if r["proxy"] else "full VPN")) if r else "not connected"))
+    m = me()
+    used, limit = m.get("used", 0), m.get("limit_gb", 0)
+    print("Signed in:  " + m.get("name", ""))
+    print("Used:       %s of %s this month (resets %s)" % (gb(used), "%g GB" % limit if limit else "no limit", m.get("resets", "on the 1st")))
+    print("Server:     " + m.get("server", {}).get("state", "unknown"))
+    if m.get("blocked"):
+        print("You've used all your data for this month.")
+
+
+def cmd_connect(args):
+    proxy_mode = "--proxy" in args
+    if running():
+        raise Fail("Already connected. Run cloudlabs-vpn disconnect first.")
+    if not os.access(SING_BOX, os.X_OK):
+        raise Fail("sing-box is missing from %s. Reinstall CloudLabs-VPN." % APP)
+    m = me()
+    if m.get("blocked"):
+        raise Fail("You've used all your data for this month. It resets on %s." % m.get("resets", "the 1st"))
+    state = m.get("server", {}).get("state")
+    if state != "running":
+        if state == "stopped" and m.get("allow_wake"):
+            status, data = call("POST", "/api/wake", token(), {})
+            if status != 200:
+                raise Fail(err(status, data))
+        elif state == "stopped":
+            raise Fail("The VPN server is paused. Ask your instructor to start it.")
+        print("Waiting for the VPN server to start (up to 3 minutes)...")
+        for _ in range(36):
+            time.sleep(5)
+            m = me()
+            if m.get("server", {}).get("state") == "running":
+                break
+        else:
+            raise Fail("The VPN server didn't start. Try again in a minute.")
+    vpn = m.get("vpn", {})
+    if not vpn.get("server") or not vpn.get("uuid"):
+        raise Fail("Couldn't get your VPN settings yet. Try again in a minute.")
+    write_private(CONFIG, build_config(vpn, proxy_mode))
+
+    cmd = [SING_BOX, "run", "-c", CONFIG, "-D", STATE]
+    if not proxy_mode and os.geteuid() != 0:
+        print("The full VPN needs admin rights. (No sudo? Use: cloudlabs-vpn connect --proxy)")
+        if subprocess.run(["sudo", "-v"]).returncode != 0:
+            raise Fail("No admin rights. Use: cloudlabs-vpn connect --proxy")
+        cmd = ["sudo", "-n"] + cmd
+    with open(LOG, "ab") as log:
+        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+    time.sleep(2)
+    if p.poll() is not None:
+        raise Fail("The VPN engine stopped right away. Details: " + LOG)
+    # sudo runs sing-box as its child and passes our kill on to it, so sudo's pid is the one to stop
+    write_private(RUN, {"pid": p.pid, "proxy": proxy_mode, "server": vpn["server"]})
+
+    ip = ""
+    for _ in range(5):
+        try:
+            ip = seen_ip(proxy_mode)
+            if ip == vpn["server"]:
+                break
+        except OSError:
+            pass
+        time.sleep(2)
+    if ip != vpn["server"]:
+        stop({"pid": p.pid})
+        raise Fail("Connected to the engine, but traffic isn't going through the VPN%s. Details: %s" % (" (seen IP %s)" % ip if ip else "", LOG))
+    print("Connected. The internet now sees you as %s." % ip)
+    if proxy_mode:
+        print("\nOnly apps that use the proxy go through the VPN. For this terminal (AWS CLI, curl, git, pip):\n"
+              "  export HTTPS_PROXY=http://127.0.0.1:%d HTTP_PROXY=http://127.0.0.1:%d ALL_PROXY=socks5h://127.0.0.1:%d\n"
+              "In your browser, set the proxy to 127.0.0.1 port %d, or start one with it:\n"
+              "  google-chrome --proxy-server=http://127.0.0.1:%d" % ((PROXY_PORT,) * 5))
+
+
+def cmd_disconnect(args):
+    r = running()
+    if not r:
+        print("Not connected.")
+        return
+    stop(r)
+    print("Disconnected.")
+
+
+COMMANDS = {"login": cmd_login, "logout": cmd_logout, "status": cmd_status, "connect": cmd_connect, "disconnect": cmd_disconnect}
+
+
+def main(argv):
+    if not argv or argv[0] not in COMMANDS:
+        print(__doc__.strip())
+        return 0 if argv and argv[0] in ("-h", "--help", "help") else 2
+    try:
+        COMMANDS[argv[0]](argv[1:])
+        return 0
+    except Fail as e:
+        print(e, file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
