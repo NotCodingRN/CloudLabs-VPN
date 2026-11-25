@@ -147,8 +147,34 @@ def seen_ip(proxy_mode, timeout=8):
 
 
 def can_full():
-    """How the full VPN gets admin rights from the window: already root, or the desktop's password prompt."""
-    return os.geteuid() == 0 or bool(shutil.which("pkexec"))
+    """The full VPN needs admin rights: already root, the desktop's password prompt, or sudo."""
+    return os.geteuid() == 0 or bool(shutil.which("pkexec") or shutil.which("sudo"))
+
+
+def admin_prefix(gui, say):
+    """How to start sing-box as root. Tries what the PC has, best first, and says why when nothing works."""
+    has_pkexec, has_sudo = shutil.which("pkexec"), shutil.which("sudo")
+    if has_sudo and subprocess.run(["sudo", "-n", "true"], stdin=subprocess.DEVNULL, capture_output=True).returncode == 0:
+        return ["sudo", "-n"], 15  # sudo already unlocked (or passwordless): no prompt needed
+    if gui:
+        if has_pkexec:
+            say("Enter your computer password in the window that opens.")
+            return ["pkexec"], 120  # time to type the password
+        raise Fail("This PC has no admin password window (pkexec). Open a terminal and run: cloudlabs-vpn connect")
+    if has_sudo:
+        print("The full VPN needs admin rights: type your computer password.")
+        r = subprocess.run(["sudo", "-v"], stderr=subprocess.PIPE, text=True)
+        if r.returncode == 0:
+            return ["sudo", "-n"], 15
+        why = (r.stderr or "").strip().splitlines()
+        if has_pkexec:
+            print("sudo said no%s. Trying the desktop password window instead." % (": " + why[-1] if why else ""))
+            return ["pkexec"], 120
+        raise Fail("sudo refused%s. Your account may not have admin rights on this PC (check: groups). "
+                   "Without them use: cloudlabs-vpn connect --proxy" % (": " + why[-1] if why else ""))
+    if has_pkexec:
+        return ["pkexec"], 120
+    raise Fail("This PC has neither sudo nor pkexec, so the full VPN can't start. Use: cloudlabs-vpn connect --proxy")
 
 
 def stop(r):
@@ -201,16 +227,7 @@ def connect(proxy_mode, gui=False, say=print):
     root = not proxy_mode and os.geteuid() != 0
     cmd, wait = [SING_BOX, "run", "-c", CONFIG, "-D", STATE], 15
     if root:
-        if gui:
-            if not shutil.which("pkexec"):
-                raise Fail("The full VPN needs admin rights, and this PC has no admin prompt. Use Proxy mode instead.")
-            say("Enter your computer password in the window that opens.")
-            pre, wait = ["pkexec"], 120  # time to type the password
-        else:
-            print("The full VPN needs admin rights. (No sudo? Use: cloudlabs-vpn connect --proxy)")
-            if subprocess.run(["sudo", "-v"]).returncode != 0:
-                raise Fail("No admin rights. Use: cloudlabs-vpn connect --proxy")
-            pre = ["sudo", "-n"]
+        pre, wait = admin_prefix(gui, say)
         cmd = pre + [shutil.which("sh") or "/bin/sh", "-c", ROOT_RUN, "cloudlabs-vpn", SING_BOX, CONFIG, STATE, STOP]
     with open(LOG, "ab") as log:
         p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
@@ -222,8 +239,8 @@ def connect(proxy_mode, gui=False, say=print):
         if p.poll() is not None:
             remove(RUN)
             if root and p.returncode in (126, 127):
-                raise Fail("Admin password cancelled. Use Proxy mode if you don't have admin rights.")
-            raise Fail("The VPN engine stopped right away. Details: " + LOG)
+                raise Fail("The admin password was cancelled or refused. If your account has no admin rights on this PC, use Proxy mode.")
+            raise Fail("The VPN engine stopped right away: %s (full log: %s)" % (last_error(), LOG))
         try:
             ip = seen_ip(proxy_mode, timeout=4)
             if ip == vpn["server"]:
@@ -234,6 +251,17 @@ def connect(proxy_mode, gui=False, say=print):
         time.sleep(1)
     stop(read_json(RUN) or {"pid": p.pid})
     raise Fail("Started the engine, but traffic isn't going through the VPN%s. Details: %s" % (" (seen IP %s)" % ip if ip else "", LOG))
+
+
+def last_error():
+    """The last meaningful line sing-box wrote, to show instead of just pointing at the log."""
+    try:
+        with open(LOG, errors="replace") as f:
+            lines = [l.strip() for l in f.readlines()[-40:] if l.strip()]
+        bad = [l for l in lines if "FATAL" in l or "ERROR" in l or "denied" in l.lower() or "not authorized" in l.lower()]
+        return (bad or lines or ["no details"])[-1][-300:]
+    except OSError:
+        return "no details"
 
 
 def disconnect():
@@ -352,7 +380,10 @@ def open_window(url):
             subprocess.Popen([b, "--app=" + url, "--window-size=440,780"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, start_new_session=True)
             return
-    webbrowser.open(url)
+    if shutil.which("xdg-open"):
+        subprocess.Popen(["xdg-open", url], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    elif not webbrowser.open(url):
+        raise Fail("Couldn't open a browser window. Open this address in your browser: " + url)
 
 
 def ping(info):
@@ -612,7 +643,7 @@ function render() {
   if (on) mode = s.connected.proxy ? "proxy" : "full";
   $("mFull").className = mode === "full" ? "sel" : ""; $("mProxy").className = mode === "proxy" ? "sel" : "";
   $("mFull").disabled = $("mProxy").disabled = on || wait;
-  if (!s.can_full) { $("mFull").disabled = true; $("mFull").title = "This PC has no admin password prompt (pkexec), so use Proxy."; }
+  if (!s.can_full) { $("mFull").disabled = true; $("mFull").title = "This PC has neither pkexec nor sudo, so use Proxy."; }
 
   const server = (m.server || {}).state || "unknown";
   const blocked = !!m.blocked, paused = server === "stopped" && !m.allow_wake;
@@ -679,6 +710,15 @@ poll();
 COMMANDS = {"gui": cmd_gui, "login": cmd_login, "logout": cmd_logout, "status": cmd_status, "connect": cmd_connect, "disconnect": cmd_disconnect}
 
 
+def launch_note(cmd, text):
+    try:
+        os.makedirs(STATE, exist_ok=True)
+        with open(os.path.join(STATE, "errors.log"), "a") as f:
+            f.write("%s  %s: %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), cmd, text) + os.linesep)
+    except OSError:
+        pass
+
+
 def main(argv):
     if not argv or argv[0] not in COMMANDS:
         print(__doc__.strip())
@@ -688,7 +728,11 @@ def main(argv):
         return 0
     except Fail as e:
         print(e, file=sys.stderr)
+        launch_note(argv[0], str(e))
         return 1
+    except Exception as e:  # started from the apps menu there's no terminal, so leave a trace
+        launch_note(argv[0], "%s: %s" % (type(e).__name__, e))
+        raise
     except KeyboardInterrupt:
         return 130
 
